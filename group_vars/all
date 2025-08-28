@@ -129,6 +129,13 @@ iscsi_target_ssh_key_name: aeros-ssh-key-rsa
 iscsi_target_volume_size: 150 # in GB
 iscsi_target_instance_type: t2.micro
 
+iscsi_target_1_name: "iscsi-target-1"
+iscsi_target_1_ip: "10.0.100.102"
+iscsi_target_2_name: "iscsi-target-2"
+iscsi_target_2_ip: "10.0.100.103"
+iscsi_target_iqn_ha: iqn.2024-02.com.example:scsi1
+
+
 # Stuff needed only for IIB
 iib_images: "{{ lookup('env', 'INDEX_IMAGES') }}"
 # We can use default(, true) below because OPERATOR is a string and not a boolean

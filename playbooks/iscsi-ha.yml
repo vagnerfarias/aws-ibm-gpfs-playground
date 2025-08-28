@@ -1,0 +1,243 @@
+---
+- name: Playbook to set up the iscsi target ec2 in aws
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars_files:
+    # Use this to override stuff that won't be committed to git
+    - ../overrides.yml
+
+  tasks:
+    - name: Print AWS infos
+      ansible.builtin.debug:
+        msg: "Region: {{ ocp_region }} - Cluster: {{ ocp_cluster_name }}.{{ ocp_domain }} - Workers [{{ ocp_worker_count }}]: {{ ocp_worker_type }} - AWS Profile: {{ aws_profile }}"
+
+    - name: Create key pair to access ec2 with ssh
+      amazon.aws.ec2_key:
+        profile: "{{ aws_profile }}"
+        region: "{{ ocp_region }}"
+        name: "{{ iscsi_target_ssh_key_name }}"
+        key_material: "{{ ssh_pubkey }}"
+
+    - name: Gather security group info for workers
+      amazon.aws.ec2_security_group_info:
+        profile: "{{ aws_profile }}"
+        region: "{{ ocp_region }}"
+        filters:
+          "tag:sigs.k8s.io/cluster-api-provider-aws/role": "node"
+      register: sg_info
+
+    - name: Set vpc and sg id
+      ansible.builtin.set_fact:
+        sg_vpc_id: "{{ sg_info.security_groups[0].vpc_id }}"
+        sg_group_id: "{{ sg_info.security_groups[0].group_id }}"
+
+    - name: Gather vpc info for workers
+      amazon.aws.ec2_vpc_subnet_info:
+        profile: "{{ aws_profile }}"
+        region: "{{ ocp_region }}"
+        filters:
+          vpc-id: "{{ sg_vpc_id }}"
+      register: subnet_info
+
+    - name: Set public subnet id
+      ansible.builtin.set_fact: # only add the public subnet, and there will be only exactly one
+        public_subnet_id: "{{ subnet_info.subnets |  selectattr('map_public_ip_on_launch', '==', true) | map(attribute='subnet_id') | first }}"
+
+    - name: Get my public IPv4
+      ansible.builtin.uri:
+        url: https://checkip.amazonaws.com
+        return_content: true
+      register: myip_v4
+      run_once: true
+
+    - name: Create ec2 security group
+      amazon.aws.ec2_security_group:
+        profile: "{{ aws_profile }}"
+        region: "{{ ocp_region }}"
+        name: iscsi-target-security-group
+        description: sec group for iscsi target ec2
+        vpc_id: "{{ sg_vpc_id }}"
+        rules:
+        - proto: tcp
+          ports:
+            - 22
+          group_id: "{{ sg_group_id }}"
+          rule_desc: allow ssh from the ocp workers to debug
+        - proto: tcp
+          ports:
+            - 3260
+          group_id: "{{ sg_group_id }}"
+          rule_desc: allow iscsi for ocp worker nodes
+        - proto: tcp
+          ports:
+            - 7789
+          group_name: iscsi-target-security-group
+          rule_desc: allow drbd traffic between iscsi target nodes 
+        - proto: tcp
+          ports:
+            - 22
+          cidr_ip: "{{ myip_v4.content | trim }}/32"
+          rule_desc: "SSH from my IPv4"
+
+    - name: Start instance "{{ iscsi_target_1_name }}" with EBS
+      amazon.aws.ec2_instance:
+        profile: "{{ aws_profile }}"
+        region: "{{ ocp_region }}"
+        name: "{{ iscsi_target_1_name }}"
+        state: started
+        wait: true
+        vpc_subnet_id: "{{ public_subnet_id }}"
+        instance_type: "{{ iscsi_target_instance_type }}"
+        key_name: "{{ iscsi_target_ssh_key_name }}"
+        security_group: iscsi-target-security-group
+        network_interfaces:
+          - assign_public_ip: false
+            private_ip_addresses:
+            - primary: true
+              private_ip_address: "{{ iscsi_target_1_ip }}"
+        image_id: "{{ iscsi_target_ami_image_id }}"
+        volumes:
+          - device_name: /dev/sdb
+            ebs:
+              volume_size: "{{ iscsi_target_volume_size }}"
+              delete_on_termination: true
+        user_data: |
+          #cloud-config
+          preserve_hostname: false
+          hostname: {{ iscsi_target_1_name }}
+          fqdn: {{ iscsi_target_1_name }}.compute.internal
+          manage_etc_hosts: true
+          bootcmd:
+            - [ bash, -lc, 'test -f /etc/selinux/config && sed -ri "s/^SELINUX=(enforcing|disabled)/SELINUX=permissive/" /etc/selinux/config' ]
+          packages:
+            - targetcli
+            - drbd-utils
+          write_files:
+            - path: /etc/drbd.d/global_common.conf
+              owner: root:root
+              permissions: 0644
+              content: |
+                global {
+                  usage-count no;
+                }
+            - path: /etc/drbd.d/r0.res
+              owner: root:root
+              permissions: 0644
+              content: |
+                resource r0 {
+                  protocol C;
+                  device /dev/drbd0;
+                  disk /dev/xvdb;
+                  meta-disk internal;
+
+                  on {{ iscsi_target_1_name }}.compute.internal {
+                  address {{ iscsi_target_1_ip }}:7789;
+                  }
+                  on {{ iscsi_target_2_name }}.compute.internal {
+                  address {{ iscsi_target_2_ip }}:7789;
+                  }
+                }
+            - path: /usr/local/sbin/configure-target.sh
+              owner: root:root
+              permissions: 0755
+              content: |
+                sudo targetcli /backstores/block create name=drbd0 dev=/dev/drbd0 wwn=057b32a3-2792-4c5a-91b7-54ae68fc9e02 #ensure known id
+                sudo targetcli iscsi/ create {{ iscsi_target_iqn_ha }}
+                sudo targetcli iscsi/{{ iscsi_target_iqn_ha }}/tpg1/luns/ create /backstores/block/block_backend
+                sudo targetcli iscsi/{{ iscsi_target_iqn_ha }}/tpg1/ set attribute generate_node_acls=1  authentication=0 demo_mode_write_protect=0 cache_dynamic_acls=1
+                sudo targetcli saveconfig
+
+          runcmd:
+            - setenforce 0 || true
+            - drbdadm create-md r0 
+            - drbdadm up r0 
+
+    - name: Start instance "{{ iscsi_target_2_name }}" with EBS
+      amazon.aws.ec2_instance:
+        profile: "{{ aws_profile }}"
+        region: "{{ ocp_region }}"
+        name: "{{ iscsi_target_2_name }}"
+        state: started
+        wait: true
+        vpc_subnet_id: "{{ public_subnet_id }}"
+        instance_type: "{{ iscsi_target_instance_type }}"
+        key_name: "{{ iscsi_target_ssh_key_name }}"
+        security_group: iscsi-target-security-group
+        network_interfaces:
+          - assign_public_ip: false
+            private_ip_addresses:
+            - primary: true
+              private_ip_address: "{{ iscsi_target_2_ip }}"
+        image_id: "{{ iscsi_target_ami_image_id }}"
+        volumes:
+          - device_name: /dev/sdb
+            ebs:
+              volume_size: "{{ iscsi_target_volume_size }}"
+              delete_on_termination: true
+        user_data: |
+          #cloud-config
+          preserve_hostname: false
+          hostname: {{ iscsi_target_2_name }}
+          fqdn: {{ iscsi_target_2_name }}.compute.internal
+          manage_etc_hosts: true
+          bootcmd:
+            - [ bash, -lc, 'test -f /etc/selinux/config && sed -ri "s/^SELINUX=(enforcing|disabled)/SELINUX=permissive/" /etc/selinux/config' ]
+          packages:
+            - targetcli
+            - drbd-utils
+          write_files:
+            - path: /etc/drbd.d/global_common.conf
+              owner: root:root
+              permissions: 0644
+              content: |
+                global {
+                  usage-count no;
+                }
+            - path: /etc/drbd.d/r0.res
+              owner: root:root
+              permissions: 0644
+              content: |
+                resource r0 {
+                  protocol C;
+                  device /dev/drbd0;
+                  disk /dev/xvdb;
+                  meta-disk internal;
+
+                  on {{ iscsi_target_1_name }}.compute.internal {
+                  address {{ iscsi_target_1_ip }}:7789;
+                  }
+                  on {{ iscsi_target_2_name }}.compute.internal {
+                  address {{ iscsi_target_2_ip }}:7789;
+                  }
+                }
+            - path: /usr/local/sbin/configure-target.sh
+              owner: root:root
+              permissions: 0755
+              content: |
+                sudo targetcli /backstores/block create name=drbd0 dev=/dev/drbd0 wwn=057b32a3-2792-4c5a-91b7-54ae68fc9e02 #ensure known id
+                sudo targetcli iscsi/ create {{ iscsi_target_iqn_ha }}
+                sudo targetcli iscsi/{{ iscsi_target_iqn_ha }}/tpg1/luns/ create /backstores/block/block_backend
+                sudo targetcli iscsi/{{ iscsi_target_iqn_ha }}/tpg1/ set attribute generate_node_acls=1  authentication=0 demo_mode_write_protect=0 cache_dynamic_acls=1
+                sudo targetcli saveconfig
+
+          runcmd:
+            - setenforce 0 || true
+            - drbdadm create-md r0 
+            - drbdadm up r0 
+
+
+    # - name: Template mco file (iscsi)
+    #   ansible.builtin.template:
+    #     src: ../templates/mco-iscsi-multipath.yaml
+    #     dest: "{{ gpfsfolder }}/mco-iscsi-multipath.yaml"
+
+    # - name: Template mco file (iscsi)
+    #   ansible.builtin.shell: |
+    #     {{ butane_bin }} "{{ gpfsfolder }}/mco-iscsi-multipath.yaml" -o "{{ gpfsfolder }}/99-mco-iscsi-multipath-butaned.yaml"
+
+    # - name: Apply MCO template (iscsi)
+    #   ansible.builtin.shell: |
+    #     set -ex
+    #     export KUBECONFIG={{ kubeconfig }}
+    #     {{ oc_bin }} apply -f "{{ gpfsfolder }}/99-mco-iscsi-multipath-butaned.yaml"
