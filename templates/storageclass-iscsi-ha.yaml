@@ -1,9 +1,9 @@
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
-  name: ibm-test-sc
-  annotations:
-    storageclass.kubevirt.io/is-default-virt-class: "true"
+  name: iscsi-ha-sc
+  #annotations:
+  #  storageclass.kubevirt.io/is-default-virt-class: "true"
 parameters:
   volBackendFs: {{ iscsi_ha_fsname }}
 provisioner: spectrumscale.csi.ibm.com

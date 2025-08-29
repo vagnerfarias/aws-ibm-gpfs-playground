@@ -1,0 +1,135 @@
+variant: openshift
+version: 4.18.0
+metadata:
+  name: 99-worker-mpath-iscsi
+  labels:
+    machineconfiguration.openshift.io/role: worker
+storage:
+  files:
+    - path: /etc/multipath.conf
+      mode: 0420
+      overwrite: true
+      contents:
+        inline: |
+          defaults {
+            user_friendly_names yes
+            find_multipaths yes
+            path_selector "round-robin 0"
+            path_checker tur
+            #retain_attached_hw_handler no   # <-- let multipath drop ALUA
+            #detect_prio no                  # <-- don't auto-pick alua prio
+          }
+
+          #devices {
+          #  device {
+          #    vendor "LIO-ORG"
+          #    product ".*"
+          #    hardware_handler "0"          # ignore ALUA
+          #    path_grouping_policy failover # 1 path per group (strict A/standby B)
+          #    prio const
+          #  }
+          #}
+
+          multipaths {
+            multipath {
+              wwid  36001405057b32a327924c5a91b754ae6
+              alias drbd_lun
+              path_grouping_policy group_by_prio
+              prio alua
+              failback immediate
+              #failback manual               # keep your manual choice
+            }
+          }
+    - path: /usr/local/sbin/iscsi-login
+      mode: 0755
+      overwrite: true
+      contents:
+        inline: |
+          #!/bin/bash
+          # Simulate multipath by using two different IPs
+          declare -a TARGET_IPS=("{{ iscsi_target_1_ip }}" "{{ iscsi_target_2_ip }}")
+          TARGET_IQN={{iscsi_target_iqn_ha}}
+          check_target() {
+          IP=$1
+          ACTIVE_SESSIONS=$(iscsiadm -m session 2>&1)
+          if [[ 0$(echo ${ACTIVE_SESSIONS} | grep -c -e "${IP}.*${TARGET_IQN}") -ge 01 ]]
+          then
+            echo "Target found"
+            return 0
+          else
+            echo "Target not found"
+            return 1
+          fi
+          }
+
+          main(){
+            for TARGET_IP in "${TARGET_IPS[@]}"; do
+              check_target ${TARGET_IP}
+              TARGET_FOUND=$?
+              if [[ 0${TARGET_FOUND} -eq 00 ]]
+              then
+                echo "iSCSI already configured for ${TARGET_IP}"
+                continue
+              else
+                echo "iSCSI not configured, configuring"
+                iscsiadm -m discovery -t st -p ${TARGET_IP}
+                sleep 3
+                iscsiadm --mode  node --target ${TARGET_IQN} --portal ${TARGET_IP} -l
+                sleep 3
+                check_target ${TARGET_IP}
+                TARGET_FOUND=$?
+                if [[ 0${TARGET_FOUND} -eq 00 ]]
+                then
+                  echo "iSCSI configured correctly"
+                  continue
+                else
+                  echo "Failed to configure iSCSI"
+                  exit 1
+                fi
+              fi
+            done
+          }
+          main
+          exit $?
+
+systemd:
+  units:
+    - name: iscsid.service
+      enabled: true
+    - name: iscsi.service
+      enabled: true
+    - name: multipathd.service
+      enabled: true
+    - name: custom-coreos-generate-iscsi-initiatorname.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=Custom CoreOS Generate iSCSI Initiator Name
+        Before=coreos-generate-iscsi-initiatorname.service
+        Before=iscsid.service
+
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/bin/sh -c 'echo "InitiatorName=`hostname`" > /etc/iscsi/initiatorname.iscsi'
+        RemainAfterExit=yes
+
+        [Install]
+        WantedBy=multi-user.target
+    - name: "iscsi-login-target.service"
+      enabled: true
+      contents: |
+        [Unit]
+        Description=Logs into the iSCSI target if not already logged in
+        Before=kubelet.service
+        After=iscsi.service iscsid.service
+
+        [Service]
+        Type=oneshot
+        RemainAfterExit=no
+        User=root
+        ExecStart=/usr/local/sbin/iscsi-login
+
+        TimeoutSec=300
+
+        [Install]
+        WantedBy=multi-user.target

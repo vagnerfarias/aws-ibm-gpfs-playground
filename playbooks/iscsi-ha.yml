@@ -126,28 +126,61 @@
               permissions: 0644
               content: |
                 resource r0 {
+                  net {
                   protocol C;
-                  device /dev/drbd0;
-                  disk /dev/xvdb;
-                  meta-disk internal;
+                  allow-two-primaries yes;
+                  after-sb-0pri discard-least-changes;
+                  after-sb-1pri discard-secondary;
+                  after-sb-2pri disconnect;	# or call-pri-lost-after-sb
+                  rr-conflict disconnect;
+                  }
+
+                startup {
+                  wfc-timeout  0;	# don’t wait forever for the peer at boot
+                  degr-wfc-timeout 30;
+                }
 
                   on {{ iscsi_target_1_name }}.compute.internal {
+                    volume 0 {
+                      device minor 0;
+                      disk /dev/xvdb;
+                      meta-disk internal;
+                    }
                   address {{ iscsi_target_1_ip }}:7789;
                   }
                   on {{ iscsi_target_2_name }}.compute.internal {
+                    volume 0 {
+                      device minor 0;
+                      disk /dev/xvdb;
+                      meta-disk internal;
+                    }
                   address {{ iscsi_target_2_ip }}:7789;
                   }
                 }
+            - path: /usr/local/sbin/drbd-initial-synch.sh
+              owner: root:root
+              permissions: 0755
+              content: |
+                sudo drbdadm new-current-uuid --clear-bitmap r0/0
             - path: /usr/local/sbin/configure-target.sh
               owner: root:root
               permissions: 0755
               content: |
                 sudo targetcli /backstores/block create name=drbd0 dev=/dev/drbd0 wwn=057b32a3-2792-4c5a-91b7-54ae68fc9e02 #ensure known id
                 sudo targetcli iscsi/ create {{ iscsi_target_iqn_ha }}
-                sudo targetcli iscsi/{{ iscsi_target_iqn_ha }}/tpg1/luns/ create /backstores/block/block_backend
+                sudo targetcli iscsi/{{ iscsi_target_iqn_ha }}/tpg1/luns/ create /backstores/block/drbd0
                 sudo targetcli iscsi/{{ iscsi_target_iqn_ha }}/tpg1/ set attribute generate_node_acls=1  authentication=0 demo_mode_write_protect=0 cache_dynamic_acls=1
                 sudo targetcli saveconfig
-
+            - path: /usr/local/sbin/target-start.sh
+              owner: root:root
+              permissions: 0755
+              content: |
+                sudo systemctl stop target
+                sudo drbdadm down r0
+                sudo drbdadm up r0
+                sudo drbdadm primary r0
+                sudo systemctl start target
+                echo "Use \"sudo watch 'drbdadm status r0; cat /proc/drbd' for monitoring\""
           runcmd:
             - setenforce 0 || true
             - drbdadm create-md r0 
@@ -199,45 +232,63 @@
               permissions: 0644
               content: |
                 resource r0 {
+                  net {
                   protocol C;
-                  device /dev/drbd0;
-                  disk /dev/xvdb;
-                  meta-disk internal;
+                  allow-two-primaries yes;
+                  after-sb-0pri discard-least-changes;
+                  after-sb-1pri discard-secondary;
+                  after-sb-2pri disconnect;	# or call-pri-lost-after-sb
+                  rr-conflict disconnect;
+                  }
+
+                startup {
+                  wfc-timeout  0;	# don’t wait forever for the peer at boot
+                  degr-wfc-timeout 30;
+                }
 
                   on {{ iscsi_target_1_name }}.compute.internal {
+                    volume 0 {
+                      device minor 0;
+                      disk /dev/xvdb;
+                      meta-disk internal;
+                    }
                   address {{ iscsi_target_1_ip }}:7789;
                   }
                   on {{ iscsi_target_2_name }}.compute.internal {
+                    volume 0 {
+                      device minor 0;
+                      disk /dev/xvdb;
+                      meta-disk internal;
+                    }
                   address {{ iscsi_target_2_ip }}:7789;
                   }
                 }
+            - path: /usr/local/sbin/drbd-initial-synch.sh
+              owner: root:root
+              permissions: 0755
+              content: |
+                sudo drbdadm new-current-uuid --clear-bitmap r0/0
             - path: /usr/local/sbin/configure-target.sh
               owner: root:root
               permissions: 0755
               content: |
                 sudo targetcli /backstores/block create name=drbd0 dev=/dev/drbd0 wwn=057b32a3-2792-4c5a-91b7-54ae68fc9e02 #ensure known id
                 sudo targetcli iscsi/ create {{ iscsi_target_iqn_ha }}
-                sudo targetcli iscsi/{{ iscsi_target_iqn_ha }}/tpg1/luns/ create /backstores/block/block_backend
+                sudo targetcli iscsi/{{ iscsi_target_iqn_ha }}/tpg1/luns/ create /backstores/block/drbd0
                 sudo targetcli iscsi/{{ iscsi_target_iqn_ha }}/tpg1/ set attribute generate_node_acls=1  authentication=0 demo_mode_write_protect=0 cache_dynamic_acls=1
                 sudo targetcli saveconfig
-
+            - path: /usr/local/sbin/target-start.sh
+              owner: root:root
+              permissions: 0755
+              content: |
+                sudo systemctl stop target
+                sudo drbdadm down r0
+                sudo drbdadm up r0
+                sudo drbdadm primary r0
+                sudo systemctl start target
+                echo "Use \"sudo watch 'drbdadm status r0; cat /proc/drbd' for monitoring\""
           runcmd:
             - setenforce 0 || true
             - drbdadm create-md r0 
             - drbdadm up r0 
-
-
-    # - name: Template mco file (iscsi)
-    #   ansible.builtin.template:
-    #     src: ../templates/mco-iscsi-multipath.yaml
-    #     dest: "{{ gpfsfolder }}/mco-iscsi-multipath.yaml"
-
-    # - name: Template mco file (iscsi)
-    #   ansible.builtin.shell: |
-    #     {{ butane_bin }} "{{ gpfsfolder }}/mco-iscsi-multipath.yaml" -o "{{ gpfsfolder }}/99-mco-iscsi-multipath-butaned.yaml"
-
-    # - name: Apply MCO template (iscsi)
-    #   ansible.builtin.shell: |
-    #     set -ex
-    #     export KUBECONFIG={{ kubeconfig }}
-    #     {{ oc_bin }} apply -f "{{ gpfsfolder }}/99-mco-iscsi-multipath-butaned.yaml"
+            
