@@ -4,10 +4,10 @@ metadata:
   name: {{ operator_name }}
   namespace: {{ operator_namespace }}
 spec:
-  channel: alpha
+  channel: stable-v1
   installPlanApproval: Automatic
   name: {{ operator_name }}
-  source: test-fusion-access-operator
+  source: certified-operators
   sourceNamespace: openshift-marketplace
 ---
 apiVersion: operators.coreos.com/v1

@@ -3,13 +3,13 @@ kind: Namespace
 metadata:
   name: {{ operator_namespace }}
 spec:
----
-apiVersion: operators.coreos.com/v1alpha1
-kind: CatalogSource
-metadata:
-  name: test-fusion-access-operator
-  namespace: openshift-marketplace
-spec:
-  displayName: Test Fusion Access Operator
-  sourceType: grpc
-  image: "{{ operator_registry }}/{{ operator_catalog }}:{{ operator_catalog_tag }}"
+# ---
+# apiVersion: operators.coreos.com/v1alpha1
+# kind: CatalogSource
+# metadata:
+#   name: test-fusion-access-operator
+#   namespace: openshift-marketplace
+# spec:
+#   displayName: Test Fusion Access Operator
+#   sourceType: grpc
+#   image: "{{ operator_registry }}/{{ operator_catalog }}:{{ operator_catalog_tag }}"
