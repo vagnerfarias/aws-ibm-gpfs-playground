@@ -5,7 +5,7 @@ metadata:
   annotations:
     storageclass.kubevirt.io/is-default-virt-class: "true"
 parameters:
-  volBackendFs: {{ iscsi_ha_fsname }}
+  volBackendFs: {{ gpfs_fs_name }}
 provisioner: spectrumscale.csi.ibm.com
 reclaimPolicy: Delete
 volumeBindingMode: Immediate
