@@ -1,120 +1,106 @@
----
-- name: Playbook to set up a gpfs filesystem in the iscsi target
-  hosts: localhost
-  gather_facts: false
-  become: false
-  vars_files:
-    # Use this to override stuff that won't be committed to git
-    - ../overrides.yml
+- name: Template mco file (iscsi)
+  ansible.builtin.template:
+    src: ../templates/mco-iscsi-ha-multipath.yaml
+    dest: "{{ gpfsfolder }}/mco-iscsi-ha-multipath.yaml"
 
-  tasks:
-    - name: Print AWS infos
-      ansible.builtin.debug:
-        msg: "Region: {{ ocp_region }} - Cluster: {{ ocp_cluster_name }}.{{ ocp_domain }} - Workers [{{ ocp_worker_count }}]: {{ ocp_worker_type }} - AWS Profile: {{ aws_profile }}"
+- name: Template mco file (iscsi)
+  ansible.builtin.shell: |
+    {{ butane_bin }} "{{ gpfsfolder }}/mco-iscsi-ha-multipath.yaml" -o "{{ gpfsfolder }}/99-mco-iscsi-ha-multipath-butaned.yaml"
 
-    - name: Template mco file (iscsi)
-      ansible.builtin.template:
-        src: ../templates/mco-iscsi-ha-multipath.yaml
-        dest: "{{ gpfsfolder }}/mco-iscsi-ha-multipath.yaml"
+- name: Apply MCO template (iscsi)
+  ansible.builtin.shell: |
+    set -ex
+    export KUBECONFIG={{ kubeconfig }}
+    {{ oc_bin }} apply -f "{{ gpfsfolder }}/99-mco-iscsi-ha-multipath-butaned.yaml"
 
-    - name: Template mco file (iscsi)
-      ansible.builtin.shell: |
-        {{ butane_bin }} "{{ gpfsfolder }}/mco-iscsi-ha-multipath.yaml" -o "{{ gpfsfolder }}/99-mco-iscsi-ha-multipath-butaned.yaml"
+- name: Pause to ensure MCP begins to be Updated
+  ansible.builtin.pause:
+    seconds: 20
 
-    - name: Apply MCO template (iscsi)
-      ansible.builtin.shell: |
-        set -ex
-        export KUBECONFIG={{ kubeconfig }}
-        {{ oc_bin }} apply -f "{{ gpfsfolder }}/99-mco-iscsi-ha-multipath-butaned.yaml"
+- name: Wait until MCP worker is Updated
+  ansible.builtin.shell: >
+    {{ oc_bin }} wait --kubeconfig {{ kubeconfig }}
+    --for=condition=Updated --timeout=20m machineconfigpool/worker
+  register: mcp_wait
+  changed_when: false
+  failed_when: mcp_wait.rc != 0
 
-    - name: Pause to ensure MCP begins to be Updated
-      ansible.builtin.pause:
-        seconds: 20
+- name: Get worker nodes names
+  tags:
+    - 6_gpfs
+  ansible.builtin.shell: |
+    export KUBECONFIG={{ kubeconfig }}
+    {{ oc_bin }} get nodes -l node-role.kubernetes.io/worker -o name | cut -f2 -d/
+  register: worker_nodes_output
 
-    - name: Wait until MCP worker is Updated
-      ansible.builtin.shell: >
-        {{ oc_bin }} wait --kubeconfig {{ kubeconfig }}
-        --for=condition=Updated --timeout=10m machineconfigpool/worker
-      register: mcp_wait
-      changed_when: false
-      failed_when: mcp_wait.rc != 0
-
-    - name: Get worker nodes names
-      tags:
-        - 6_gpfs
-      ansible.builtin.shell: |
-        export KUBECONFIG={{ kubeconfig }}
-        {{ oc_bin }} get nodes -l node-role.kubernetes.io/worker -o name | cut -f2 -d/
-      register: worker_nodes_output
-
-    - name: Set worker nodes names fact
-      tags:
-        - 6_gpfs
-      ansible.builtin.set_fact:
-        worker_nodes: "{{ worker_nodes_output.stdout_lines }}"
+- name: Set worker nodes names fact
+  tags:
+    - 6_gpfs
+  ansible.builtin.set_fact:
+    worker_nodes: "{{ worker_nodes_output.stdout_lines }}"
 
 
-    - name: Template the localdisk
-      tags:
-        - 6_gpfs
-      ansible.builtin.template:
-        src: ../templates/localdisk-iscsi-ha.yaml
-        dest: "{{ gpfsfolder }}/localdisk-iscsi-ha.yaml"
+- name: Template the localdisk
+  tags:
+    - 6_gpfs
+  ansible.builtin.template:
+    src: ../templates/localdisk-iscsi-ha.yaml
+    dest: "{{ gpfsfolder }}/localdisk-iscsi-ha.yaml"
 
-    - name: Apply the localdisk
-      tags:
-        - 6_gpfs
-      ansible.builtin.shell: |
-        set -ex
-        export KUBECONFIG={{ kubeconfig }}
-        {{ oc_bin }} apply -f "{{ gpfsfolder }}/localdisk-iscsi-ha.yaml"
-      retries: 10
-      delay: 30
-      register: localdisk_ready
-      until: localdisk_ready is not failed
+- name: Apply the localdisk
+  tags:
+    - 6_gpfs
+  ansible.builtin.shell: |
+    set -ex
+    export KUBECONFIG={{ kubeconfig }}
+    {{ oc_bin }} apply -f "{{ gpfsfolder }}/localdisk-iscsi-ha.yaml"
+  retries: 10
+  delay: 30
+  register: localdisk_ready
+  until: localdisk_ready is not failed
 
-    - name: Template the filesystem
-      tags:
-        - 7_gpfs
-      ansible.builtin.template:
-        src: ../templates/filesystem-iscsi-ha.yaml
-        dest: "{{ gpfsfolder }}/filesystem-iscsi-ha.yaml"
+- name: Template the filesystem
+  tags:
+    - 7_gpfs
+  ansible.builtin.template:
+    src: ../templates/filesystem-iscsi-ha.yaml
+    dest: "{{ gpfsfolder }}/filesystem-iscsi-ha.yaml"
 
-    - name: Apply the filesystem
-      tags:
-        - 7_gpfs
-      ansible.builtin.shell: |
-        set -ex
-        export KUBECONFIG={{ kubeconfig }}
-        {{ oc_bin }} apply -f "{{ gpfsfolder }}/filesystem-iscsi-ha.yaml"
-      retries: 10
-      delay: 30
-      register: filesystem_ready
-      until: filesystem_ready is not failed
+- name: Apply the filesystem
+  tags:
+    - 7_gpfs
+  ansible.builtin.shell: |
+    set -ex
+    export KUBECONFIG={{ kubeconfig }}
+    {{ oc_bin }} apply -f "{{ gpfsfolder }}/filesystem-iscsi-ha.yaml"
+  retries: 10
+  delay: 30
+  register: filesystem_ready
+  until: filesystem_ready is not failed
 
-    - name: Wait for the filesystem to be ready
-      tags:
-        - 7_gpfs
-      ansible.builtin.shell: |
-        set -ex
-        export KUBECONFIG={{ kubeconfig }}
-        {{ oc_bin }} get filesystem -n ibm-spectrum-scale {{ iscsi_ha_fsname }} -o jsonpath='{.status.pools[0].totalDiskSize}' | grep "{{ ebs_volume_size }}"
-      retries: 15
-      delay: 30
-      register: filesystem_ready
-      until: filesystem_ready is not failed
+- name: Wait for the filesystem to be ready
+  tags:
+    - 7_gpfs
+  ansible.builtin.shell: |
+    set -ex
+    export KUBECONFIG={{ kubeconfig }}
+    {{ oc_bin }} get filesystem -n ibm-spectrum-scale {{ iscsi_ha_fsname }} -o jsonpath='{.status.pools[0].totalDiskSize}' | grep "{{ ebs_volume_size }}"
+  retries: 15
+  delay: 30
+  register: filesystem_ready
+  until: filesystem_ready is not failed
 
-    - name: Template the storageclass
-      tags:
-        - 7_gpfs
-      ansible.builtin.template:
-        src: ../templates/storageclass-iscsi-ha.yaml
-        dest: "{{ gpfsfolder }}/storageclass-iscsi-ha.yaml"
+- name: Template the storageclass
+  tags:
+    - 7_gpfs
+  ansible.builtin.template:
+    src: ../templates/storageclass-iscsi-ha.yaml
+    dest: "{{ gpfsfolder }}/storageclass-iscsi-ha.yaml"
 
-    - name: Apply the storageclass
-      tags:
-        - 7_gpfs
-      ansible.builtin.shell: |
-        set -ex
-        export KUBECONFIG={{ kubeconfig }}
-        {{ oc_bin }} apply -f "{{ gpfsfolder }}/storageclass-iscsi-ha.yaml"
+- name: Apply the storageclass
+  tags:
+    - 7_gpfs
+  ansible.builtin.shell: |
+    set -ex
+    export KUBECONFIG={{ kubeconfig }}
+    {{ oc_bin }} apply -f "{{ gpfsfolder }}/storageclass-iscsi-ha.yaml"

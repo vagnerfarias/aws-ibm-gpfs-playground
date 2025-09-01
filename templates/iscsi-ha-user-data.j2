@@ -1,0 +1,87 @@
+#cloud-config
+preserve_hostname: false
+hostname: {{ self_name }}
+fqdn: {{ self_name }}.compute.internal
+manage_etc_hosts: true
+bootcmd:
+  - [ bash, -lc, 'test -f /etc/selinux/config && sed -ri "s/^SELINUX=(enforcing|disabled)/SELINUX=permissive/" /etc/selinux/config' ]
+packages:
+  - targetcli
+  - drbd-utils
+write_files:
+  - path: /etc/drbd.d/global_common.conf
+    owner: root:root
+    permissions: 0644
+    content: |
+      global {
+        usage-count no;
+      }
+  - path: /etc/drbd.d/r0.res
+    owner: root:root
+    permissions: 0644
+    content: |
+      resource r0 {
+        net {
+        protocol C;
+        allow-two-primaries yes;
+        after-sb-0pri discard-least-changes;
+        after-sb-1pri discard-secondary;
+        after-sb-2pri disconnect;	# or call-pri-lost-after-sb
+        rr-conflict disconnect;
+        }
+
+      startup {
+        wfc-timeout  0;	# don’t wait forever for the peer at boot
+        degr-wfc-timeout 30;
+      }
+
+        on {{ self_name }}.compute.internal {
+          volume 0 {
+            device minor 0;
+            disk /dev/xvdb;
+            meta-disk internal;
+          }
+        address {{ self_ip }}:7789;
+        }
+        on {{ peer_name }}.compute.internal {
+          volume 0 {
+            device minor 0;
+            disk /dev/xvdb;
+            meta-disk internal;
+          }
+        address {{ peer_ip }}:7789;
+        }
+      }
+  - path: /usr/local/sbin/drbd-initial-sync.sh
+    owner: root:root
+    permissions: 0755
+    content: |
+      #!/bin/bash
+      sudo drbdadm new-current-uuid --clear-bitmap r0/0
+  - path: /usr/local/sbin/configure-target.sh
+    owner: root:root
+    permissions: 0755
+    content: |
+      #!/bin/bash
+      sudo drbdadm primary r0
+      sudo targetcli /backstores/block create name=drbd0 dev=/dev/drbd0 wwn=057b32a3-2792-4c5a-91b7-54ae68fc9e02 #ensure known id
+      sudo targetcli iscsi/ create {{ iscsi_target_iqn_ha }}
+      sudo targetcli iscsi/{{ iscsi_target_iqn_ha }}/tpg1/luns/ create /backstores/block/drbd0
+      sudo targetcli iscsi/{{ iscsi_target_iqn_ha }}/tpg1/ set attribute generate_node_acls=1  authentication=0 demo_mode_write_protect=0 cache_dynamic_acls=1
+      sudo targetcli saveconfig
+  - path: /usr/local/sbin/target-start.sh
+    owner: root:root
+    permissions: 0755
+    content: |
+      #!/bin/bash
+      sudo systemctl stop target
+      sudo drbdadm down r0
+      sudo drbdadm up r0
+      sudo drbdadm primary r0
+      sudo systemctl start target
+      echo "Use \"sudo watch 'drbdadm status r0; cat /proc/drbd' for monitoring\""
+runcmd:
+  - setenforce 0 || true
+  - drbdadm create-md r0 
+  - drbdadm up r0 
+  

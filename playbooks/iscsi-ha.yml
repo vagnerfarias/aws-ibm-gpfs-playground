@@ -6,6 +6,16 @@
   vars_files:
     # Use this to override stuff that won't be committed to git
     - ../overrides.yml
+  vars:
+    iscsi_pairs:
+    - self_name: "{{ iscsi_target_1_name }}"
+      self_ip:   "{{ iscsi_target_1_ip }}"
+      peer_name: "{{ iscsi_target_2_name }}"
+      peer_ip:   "{{ iscsi_target_2_ip }}"
+    - self_name: "{{ iscsi_target_2_name }}"
+      self_ip:   "{{ iscsi_target_2_ip }}"
+      peer_name: "{{ iscsi_target_1_name }}"
+      peer_ip:   "{{ iscsi_target_1_ip }}"
 
   tasks:
     - name: Print AWS infos
@@ -80,11 +90,11 @@
           cidr_ip: "{{ myip_v4.content | trim }}/32"
           rule_desc: "SSH from my IPv4"
 
-    - name: Start instance "{{ iscsi_target_1_name }}" with EBS
+    - name: Start iscsi target instance with EBS
       amazon.aws.ec2_instance:
         profile: "{{ aws_profile }}"
         region: "{{ ocp_region }}"
-        name: "{{ iscsi_target_1_name }}"
+        name: "{{ item.self_name }}"
         state: started
         wait: true
         vpc_subnet_id: "{{ public_subnet_id }}"
@@ -92,203 +102,92 @@
         key_name: "{{ iscsi_target_ssh_key_name }}"
         security_group: iscsi-target-security-group
         network_interfaces:
-          - assign_public_ip: false
+          - assign_public_ip: true
             private_ip_addresses:
             - primary: true
-              private_ip_address: "{{ iscsi_target_1_ip }}"
+              private_ip_address: "{{ item.self_ip }}"
         image_id: "{{ iscsi_target_ami_image_id }}"
         volumes:
           - device_name: /dev/sdb
             ebs:
               volume_size: "{{ iscsi_target_volume_size }}"
               delete_on_termination: true
-        user_data: |
-          #cloud-config
-          preserve_hostname: false
-          hostname: {{ iscsi_target_1_name }}
-          fqdn: {{ iscsi_target_1_name }}.compute.internal
-          manage_etc_hosts: true
-          bootcmd:
-            - [ bash, -lc, 'test -f /etc/selinux/config && sed -ri "s/^SELINUX=(enforcing|disabled)/SELINUX=permissive/" /etc/selinux/config' ]
-          packages:
-            - targetcli
-            - drbd-utils
-          write_files:
-            - path: /etc/drbd.d/global_common.conf
-              owner: root:root
-              permissions: 0644
-              content: |
-                global {
-                  usage-count no;
-                }
-            - path: /etc/drbd.d/r0.res
-              owner: root:root
-              permissions: 0644
-              content: |
-                resource r0 {
-                  net {
-                  protocol C;
-                  allow-two-primaries yes;
-                  after-sb-0pri discard-least-changes;
-                  after-sb-1pri discard-secondary;
-                  after-sb-2pri disconnect;	# or call-pri-lost-after-sb
-                  rr-conflict disconnect;
-                  }
+        user_data: "{{ lookup('template', '../templates/iscsi-ha-user-data.j2') }}"
+      loop: "{{ iscsi_pairs }}"
+      loop_control:
+        label: "{{ item.self_name }}" 
+      vars:
+        self_name: "{{ item.self_name }}"
+        self_ip:   "{{ item.self_ip }}"
+        peer_name: "{{ item.peer_name }}"
+        peer_ip:   "{{ item.peer_ip }}"
+      async: 3600        # run up to 60m in background for each item
+      poll: 0            # don't wait here; just fire and continue
+      register: launch_async
 
-                startup {
-                  wfc-timeout  0;	# don’t wait forever for the peer at boot
-                  degr-wfc-timeout 30;
-                }
+    # --- Wait for all async launches to finish ------------------------------
+    - name: Wait for each async launch to complete
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      register: launch_wait
+      until: launch_wait.finished
+      retries: 20       # up to 20 minutes total (240 * 5s)
+      delay: 30
+      loop: "{{ launch_async.results }}"
 
-                  on {{ iscsi_target_1_name }}.compute.internal {
-                    volume 0 {
-                      device minor 0;
-                      disk /dev/xvdb;
-                      meta-disk internal;
-                    }
-                  address {{ iscsi_target_1_ip }}:7789;
-                  }
-                  on {{ iscsi_target_2_name }}.compute.internal {
-                    volume 0 {
-                      device minor 0;
-                      disk /dev/xvdb;
-                      meta-disk internal;
-                    }
-                  address {{ iscsi_target_2_ip }}:7789;
-                  }
-                }
-            - path: /usr/local/sbin/drbd-initial-synch.sh
-              owner: root:root
-              permissions: 0755
-              content: |
-                sudo drbdadm new-current-uuid --clear-bitmap r0/0
-            - path: /usr/local/sbin/configure-target.sh
-              owner: root:root
-              permissions: 0755
-              content: |
-                sudo targetcli /backstores/block create name=drbd0 dev=/dev/drbd0 wwn=057b32a3-2792-4c5a-91b7-54ae68fc9e02 #ensure known id
-                sudo targetcli iscsi/ create {{ iscsi_target_iqn_ha }}
-                sudo targetcli iscsi/{{ iscsi_target_iqn_ha }}/tpg1/luns/ create /backstores/block/drbd0
-                sudo targetcli iscsi/{{ iscsi_target_iqn_ha }}/tpg1/ set attribute generate_node_acls=1  authentication=0 demo_mode_write_protect=0 cache_dynamic_acls=1
-                sudo targetcli saveconfig
-            - path: /usr/local/sbin/target-start.sh
-              owner: root:root
-              permissions: 0755
-              content: |
-                sudo systemctl stop target
-                sudo drbdadm down r0
-                sudo drbdadm up r0
-                sudo drbdadm primary r0
-                sudo systemctl start target
-                echo "Use \"sudo watch 'drbdadm status r0; cat /proc/drbd' for monitoring\""
-          runcmd:
-            - setenforce 0 || true
-            - drbdadm create-md r0 
-            - drbdadm up r0 
+    # Gather each job's EC2 instance dict (first in the list), whether it's under result or not
+    - name: Collate instance objects from async results
+      set_fact:
+        instances_all: >-
+          {{
+            (instances_all | default([]))
+            + [ (item.result.instances | default(item.instances) | first) ]
+          }}
+      loop: "{{ launch_wait.results }}"
+      loop_control:
+        label: "{{ (item.item.self_name | default(item.ansible_job_id)) }}"
 
-    - name: Start instance "{{ iscsi_target_2_name }}" with EBS
-      amazon.aws.ec2_instance:
-        profile: "{{ aws_profile }}"
-        region: "{{ ocp_region }}"
-        name: "{{ iscsi_target_2_name }}"
-        state: started
-        wait: true
-        vpc_subnet_id: "{{ public_subnet_id }}"
-        instance_type: "{{ iscsi_target_instance_type }}"
-        key_name: "{{ iscsi_target_ssh_key_name }}"
-        security_group: iscsi-target-security-group
-        network_interfaces:
-          - assign_public_ip: false
-            private_ip_addresses:
-            - primary: true
-              private_ip_address: "{{ iscsi_target_2_ip }}"
-        image_id: "{{ iscsi_target_ami_image_id }}"
-        volumes:
-          - device_name: /dev/sdb
-            ebs:
-              volume_size: "{{ iscsi_target_volume_size }}"
-              delete_on_termination: true
-        user_data: |
-          #cloud-config
-          preserve_hostname: false
-          hostname: {{ iscsi_target_2_name }}
-          fqdn: {{ iscsi_target_2_name }}.compute.internal
-          manage_etc_hosts: true
-          bootcmd:
-            - [ bash, -lc, 'test -f /etc/selinux/config && sed -ri "s/^SELINUX=(enforcing|disabled)/SELINUX=permissive/" /etc/selinux/config' ]
-          packages:
-            - targetcli
-            - drbd-utils
-          write_files:
-            - path: /etc/drbd.d/global_common.conf
-              owner: root:root
-              permissions: 0644
-              content: |
-                global {
-                  usage-count no;
-                }
-            - path: /etc/drbd.d/r0.res
-              owner: root:root
-              permissions: 0644
-              content: |
-                resource r0 {
-                  net {
-                  protocol C;
-                  allow-two-primaries yes;
-                  after-sb-0pri discard-least-changes;
-                  after-sb-1pri discard-secondary;
-                  after-sb-2pri disconnect;	# or call-pri-lost-after-sb
-                  rr-conflict disconnect;
-                  }
+    - name: Add iSCSI targets to inventory
+      add_host:
+        name: "{{ item.tags.Name | default(item.instance_id) }}"
+        groups: iscsi_targets
+        ansible_host: "{{ item.public_ip_address }}"
+        ansible_user: "{{ iscsi_ha_ssh_user }}"
+        ansible_ssh_private_key_file: "{{ iscsi_target_ssh_private_key_file }}"
+      loop: "{{ instances_all }}"
 
-                startup {
-                  wfc-timeout  0;	# don’t wait forever for the peer at boot
-                  degr-wfc-timeout 30;
-                }
+    # --- Wait for SSH, then delegate tasks ----------------------------------
+    - name: Wait for SSH on each iSCSI target
+      wait_for_connection:
+        timeout: 300
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['iscsi_targets'] | default([]) }}"
 
-                  on {{ iscsi_target_1_name }}.compute.internal {
-                    volume 0 {
-                      device minor 0;
-                      disk /dev/xvdb;
-                      meta-disk internal;
-                    }
-                  address {{ iscsi_target_1_ip }}:7789;
-                  }
-                  on {{ iscsi_target_2_name }}.compute.internal {
-                    volume 0 {
-                      device minor 0;
-                      disk /dev/xvdb;
-                      meta-disk internal;
-                    }
-                  address {{ iscsi_target_2_ip }}:7789;
-                  }
-                }
-            - path: /usr/local/sbin/drbd-initial-synch.sh
-              owner: root:root
-              permissions: 0755
-              content: |
-                sudo drbdadm new-current-uuid --clear-bitmap r0/0
-            - path: /usr/local/sbin/configure-target.sh
-              owner: root:root
-              permissions: 0755
-              content: |
-                sudo targetcli /backstores/block create name=drbd0 dev=/dev/drbd0 wwn=057b32a3-2792-4c5a-91b7-54ae68fc9e02 #ensure known id
-                sudo targetcli iscsi/ create {{ iscsi_target_iqn_ha }}
-                sudo targetcli iscsi/{{ iscsi_target_iqn_ha }}/tpg1/luns/ create /backstores/block/drbd0
-                sudo targetcli iscsi/{{ iscsi_target_iqn_ha }}/tpg1/ set attribute generate_node_acls=1  authentication=0 demo_mode_write_protect=0 cache_dynamic_acls=1
-                sudo targetcli saveconfig
-            - path: /usr/local/sbin/target-start.sh
-              owner: root:root
-              permissions: 0755
-              content: |
-                sudo systemctl stop target
-                sudo drbdadm down r0
-                sudo drbdadm up r0
-                sudo drbdadm primary r0
-                sudo systemctl start target
-                echo "Use \"sudo watch 'drbdadm status r0; cat /proc/drbd' for monitoring\""
-          runcmd:
-            - setenforce 0 || true
-            - drbdadm create-md r0 
-            - drbdadm up r0 
-            
+    - name: Choose primary target (first in group)
+      set_fact:
+        iscsi_primary: "{{ groups['iscsi_targets'][0] }}"
+
+    - name: DRBD initial setup
+      ansible.builtin.command: "/usr/local/sbin/drbd-initial-sync.sh"
+      changed_when: false
+      delegate_to: "{{ iscsi_primary }}"
+
+    - name: Configure iSCSI target service on both servers
+      ansible.builtin.command: "/usr/local/sbin/configure-target.sh"
+      become: false
+      changed_when: false
+      loop: "{{ groups['iscsi_targets'] }}"
+      loop_control: { loop_var: target }
+      delegate_to: "{{ target }}"
+
+    - name: Start iSCSI target service on both servers
+      ansible.builtin.command: "systemctl start target"
+      become: true
+      changed_when: false
+      loop: "{{ groups['iscsi_targets'] }}"
+      loop_control: { loop_var: target }
+      delegate_to: "{{ target }}"
+
+    # Creates localdisk + filesystem + test environment
+    - name: Setup gpfs filesystem
+      ansible.builtin.import_tasks: gpfs-iscsi-fs-setup.yml
