@@ -1,0 +1,27 @@
+plugin: amazon.aws.aws_ec2
+# Optional if you use a named AWS profile:
+# boto_profile: myprofile
+regions: [us-east-2]
+
+filters:
+  "tag:Role": iscsi-target
+  "instance-state-name": running
+
+# Use the EC2 Name tag as the inventory hostname: iscsi-target-1 / iscsi-target-2
+hostnames:
+  - tag:Name
+
+# Connection vars (tweak user/key and public/private ip as you prefer)
+compose:
+  ansible_host: public_ip_address        # or: private_ip_address
+  ansible_ssh_common_args: >-
+     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10
+
+# Put both hosts in a handy group
+groups:
+  iscsi_targets: tags.Role == 'iscsi-target'
+
+# (Optional) also create tag-based groups like tag_Role_iscsi-target
+keyed_groups:
+  - key: tags.Role
+    prefix: tag_Role

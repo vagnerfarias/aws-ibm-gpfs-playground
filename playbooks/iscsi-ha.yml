@@ -191,3 +191,19 @@
     # Creates localdisk + filesystem + test environment
     - name: Setup gpfs filesystem
       ansible.builtin.import_tasks: gpfs-iscsi-fs-setup.yml
+
+
+    - name: Template the test deployment
+      tags:
+        - test-app
+      ansible.builtin.template:
+        src: ../templates/test_ha_consume.yaml
+        dest: "{{ gpfsfolder }}/test_ha_consume.yaml"
+
+    - name: Apply the test deployment
+      tags:
+        - test-app
+      ansible.builtin.shell: |
+        set -ex
+        export KUBECONFIG={{ kubeconfig }}
+        {{ oc_bin }} apply -f "{{ gpfsfolder }}/test_ha_consume.yaml"

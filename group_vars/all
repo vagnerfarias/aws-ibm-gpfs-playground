@@ -134,7 +134,14 @@ iscsi_target_1_ip: "10.0.100.102"
 iscsi_target_2_name: "iscsi-target-2"
 iscsi_target_2_ip: "10.0.100.103"
 iscsi_target_iqn_ha: iqn.2024-02.com.example:scsi1
+iscsi_target_ssh_key_name: "vfarias-ssh-key"
+iscsi_target_ssh_private_key_file: "~/.ssh/id_rsa"
 
+iscsi_ha_device: "/dev/disk/by-id/dm-name-drbd_lun"
+iscsi_ha_fsname: "iscsi-ha-fs"
+
+ansible_user: "{{ iscsi_ha_ssh_user | default('fedora') }}"
+ansible_ssh_private_key_file: "{{ iscsi_target_ssh_private_key_file | default('~/.ssh/id_rsa') }}"
 
 # Stuff needed only for IIB
 iib_images: "{{ lookup('env', 'INDEX_IMAGES') }}"
