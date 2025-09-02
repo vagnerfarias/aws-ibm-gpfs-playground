@@ -81,3 +81,7 @@ Run `make gpfs-health` to run some GPFS healthcheck commands
 ## Delete GPFS objects
 
 Run `make gpfs-cleanup` to remove all the gpfs objects we know about
+
+## Deploy iSCSI servers with DRBD 
+
+Run `make iscsi-ha` to deploy a pair of Fedora instances with iSCSI target enabled, providing access to a replicated device using DRBD. 
